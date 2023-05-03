@@ -1,0 +1,387 @@
+---
+title: "Weather Stations"
+output:
+  html_document: default
+  html_notebook: default
+fig_width: '100%'
+---
+
+{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir ="O:/PPA/Advanced Analytics/Operational/Reporting Impact of Weather on Loss Experience/weatherStationInterpolation")
+
+easypackages::packages("readr", "data.table",  "dplyr",  "raster", "tm", "lubridate", "tidyr")
+{r, message=FALSE}
+user_input_path <- "../Climate Summary CSVs/"
+user_input_files <- list.files(path = user_input_path)
+user_input_path_historical <- "../Climate Summary CSVs historical/"
+user_input_files_historical <- list.files(path = user_input_path_historical)
+user_input_files = user_input_files[grepl('2016',user_input_files) | grepl('2017',user_input_files) | grepl('2018',user_input_files) | grepl('2019',user_input_files) | grepl('2020',user_input_files) | grepl('2021',user_input_files)]
+user_input_files = user_input_files[grepl('eng-climate-summaries',user_input_files)]
+user_input_files_historical = user_input_files_historical[grepl('2013',user_input_files_historical) | grepl('2014',user_input_files_historical) | grepl('2015',user_input_files_historical)]
+user_input_files_historical = user_input_files_historical[grepl('eng-climate-summaries',user_input_files_historical)]
+for (i in user_input_files){
+ assign(i,fread(paste(user_input_path,i,sep=""), skip = 31,na.strings="NA"))
+} 
+for (i in user_input_files_historical){
+ assign(i,fread(paste(user_input_path_historical,i,sep=""), skip = 31,na.strings="NA"))
+} 
+
+#function to append datasets and include table name as a field
+AppendMe <- function(user_input_files) {
+  do.call(rbind, lapply(user_input_files, function(x) {
+    cbind(get(x), source = x)
+  }))
+}
+
+#append individual files
+eng_climate_summaries <- AppendMe(user_input_files)
+eng_climate_summaries_historical <- AppendMe(user_input_files_historical)
+eng_climate_summaries_combined<-rbind(eng_climate_summaries_historical,eng_climate_summaries)
+
+#change data types
+eng_climate_summaries_combined <- eng_climate_summaries_combined %>% mutate_if(is.factor, as.character) 
+stopwords = c("eng-climate-summaries-All-", ".csv")
+eng_climate_summaries_combined$trim <- removeWords(eng_climate_summaries_combined$source, stopwords)
+eng_climate_summaries_combined$month <- as.numeric(sub(",.*$","",eng_climate_summaries_combined$trim))
+eng_climate_summaries_combined$quarter <- quarter(eng_climate_summaries_combined$month, with_year = FALSE, fiscal_start = 1)
+eng_climate_summaries_combined$year <- as.numeric(sub("^.*,","",eng_climate_summaries_combined$trim))
+eng_climate_summaries_combined <- subset(eng_climate_summaries_combined, select = -c(source, trim))
+
+# removing everything from R environment expect the final dataset
+rm(list = setdiff(ls(),'eng_climate_summaries_combined'))
+
+## Renaming variables and Changing data types
+
+weather.data <- eng_climate_summaries_combined %>% 
+  # dplyr::select(Clim_ID, Stn_Name, Lat, Long, Prov, P,Tm,D,Tx,Tn,`S%N`,`P%N`,S,S_G,Pd,HDD,CDD, year, quarter, month) %>%
+  rename(ID = Clim_ID, NAME = Stn_Name, LAT = Lat, LONG = Long) %>%
+  mutate_if(is.integer, as.numeric)%>%
+  mutate_if(is.logical, as.numeric) %>%
+  mutate(P = as.numeric(P), `S%N` = as.numeric(`S%N`), `P%N` = as.numeric(`P%N`) )
+
+## Calculating rolling year for ON and AB, data which is not required for analysis in each province is represented by 0 in the rolling year of that province
+
+weather.data <- weather.data %>% 
+  mutate(roll_yr_AB = if_else(quarter == 4, year+1, year),
+         roll_yr_ON = if_else(quarter == 4, year+1, year),
+         roll_yr_NB = if_else(quarter == 4, year+1, year),
+         roll_yr_NS = if_else(quarter == 4, year+1, year),
+         roll_yr_PE = if_else(quarter == 4, year+1, year),
+         roll_yr_QC = if_else(quarter == 4, year+1, year))
+
+
+
+## Function to get  yearly features at ID level, Parameters: data, grouping variables id,roll_yr , prov condition and roll_yr condition
+
+# Parameters: data, grouping variables id,roll_yr , prov condition and roll_yr condition
+GetFeatures <- function(df, groupvar1, groupvar2, prov_cond, roll_yr_cond){
+df.mod <- df %>%
+  filter_(prov_cond)%>%
+  filter_(roll_yr_cond)%>%
+  group_by_at(vars(groupvar1,groupvar2))%>%
+  summarise(NAME                     = first(NAME),
+            LAT                      = first(LAT),
+            LONG                     = first(LONG),
+            PROV                     = first(Prov),
+            avg_temp                 = mean(Tm, na.rm = TRUE),
+            avg_dwo_vaild_temp       = mean(DwTm, na.rm = TRUE),
+            avg_temp_diff_norm       = mean(D, na.rm = TRUE),
+            temp_max                 = max(Tx, na.rm = TRUE),
+            avg_max_temp             = mean(Tx, na.rm = TRUE),
+            avg_dwo_valid_max_temp   = mean(DwTx, na.rm = TRUE),
+            avg_min_temp             = mean(Tn, na.rm =TRUE),
+            temp_min                 = min(Tn, na.rm =TRUE),
+            avg_dwo_valid_min_temp   = mean(DwTn, na.rm = TRUE),
+            avg_snow                 = mean(S, na.rm =TRUE),
+            avg_dwo_valid_snow       = mean(DwS, na.rm = TRUE),
+            avg_perc_norm_snow       = mean(as.numeric(`S%N`), na.rm = TRUE),
+            avg_precip               = mean(as.numeric(P), na.rm =TRUE),
+            avg_dwo_valid_precip     = mean(DwP, na.rm = TRUE),
+            avg_perc_norm_precip     = mean(`P%N`, na.rm =TRUE),
+            avg_snow_ground_dec      = mean(S_G[month=="12"], na.rm = TRUE),
+            avg_snow_ground_jan      = mean(S_G[month=="1"], na.rm = TRUE),
+            avg_snow_ground_feb      = mean(S_G[month=="2"], na.rm = TRUE),
+            avg_snow_ground_mar      = mean(S_G[month=="3"], na.rm = TRUE),
+            avg_days_precip_GT_1mm   = mean(Pd,na.rm=TRUE),
+            avg_sunshine_hrs         = mean(BS, na.rm = TRUE),
+            avg_dwo_valid_sunshine   = mean(DwBS, na.rm = TRUE),
+            avg_perc_norm_sunshine   = mean(`BS%`, na.rm = TRUE),
+            avg_heating_req_days     = mean(HDD,na.rm=TRUE),
+            avg_AC_req_days          = mean(CDD,na.rm=TRUE)
+            )%>%
+  rename_("roll_yr" = groupvar2 )%>%
+  arrange(desc(roll_yr),.by_group = TRUE)
+
+## replacing NAN and Infinite values with 0
+df.mod<-as.data.frame(lapply(df.mod,function(x) ifelse(is.infinite(x)| is.nan(x),0,x)))
+
+## calculating  yearly avg_snow_ground using months dec,jan,feb,mar
+df.mod <- df.mod %>%
+  mutate(avg_snow_ground = (avg_snow_ground_dec + avg_snow_ground_jan + avg_snow_ground_feb + avg_snow_ground_mar)/4)
+  
+
+
+return(df.mod)
+}
+
+
+
+## Function to get cummulative features over yeras at ID level
+
+GetCummulativeFeatures <- function(df, groupvar){
+weather.data.mod.cs <- df%>%
+  group_by_at(groupvar) %>%
+  mutate(avg_temp_mean                  =  cummean(avg_temp             )
+         ,avg_dwo_vaild_temp_mean       =  cummean(avg_dwo_vaild_temp    )
+         ,avg_temp_diff_norm_mean       =  cummean(avg_temp_diff_norm    )
+         ,temp_max_max                  =  max(temp_max              )
+         ,avg_max_temp_mean             =  cummean(avg_max_temp          )
+         ,avg_dwo_valid_max_temp_mean   =  cummean(avg_dwo_valid_max_temp)
+         ,avg_min_temp_mean             =  cummean(avg_min_temp          )
+         ,temp_min_min                  =  min(temp_min              )
+         ,avg_dwo_valid_min_temp_mean   =  cummean(avg_dwo_valid_min_temp)
+         ,avg_snow_mean                 =  cummean(avg_snow              )
+         ,avg_dwo_valid_snow_mean       =  cummean(avg_dwo_valid_snow    )
+         ,avg_perc_norm_snow_mean       =  cummean(avg_perc_norm_snow    )
+         ,avg_precip_mean               =  cummean(avg_precip            )
+         ,avg_dwo_valid_precip_mean     =  cummean(avg_dwo_valid_precip  )
+         ,avg_perc_norm_precip_mean     =  cummean(avg_perc_norm_precip  )
+         ,avg_snow_ground_dec_mean      =  cummean(avg_snow_ground_dec   )
+         ,avg_snow_ground_jan_mean      =  cummean(avg_snow_ground_jan   )
+         ,avg_snow_ground_feb_mean      =  cummean(avg_snow_ground_feb   )
+         ,avg_snow_ground_mar_mean      =  cummean(avg_snow_ground_mar   )
+         ,avg_snow_ground_mean          =  cummean(avg_snow_ground       )
+         ,avg_days_precip_GT_1mm_mean   =  cummean(avg_days_precip_GT_1mm)  
+         ,avg_sunshine_hrs_mean         =  cummean(avg_sunshine_hrs      )  
+         ,avg_dwo_valid_sunshine_mean   =  cummean(avg_dwo_valid_sunshine)  
+         ,avg_perc_norm_sunshine_mean   =  cummean(avg_perc_norm_sunshine)
+         ,avg_heating_req_days_mean     =  cummean(avg_heating_req_days  )
+         ,avg_AC_req_days_mean          =  cummean(avg_AC_req_days       )
+                 ) %>%
+  arrange(ID, desc(roll_yr))
+return(weather.data.mod.cs)
+}
+
+
+
+
+## Function to transpose data and renaming variables, Transposing using ID, name,lat,long and prov as key and roll_yr as value
+
+DoTransposeAndRename <- function(df){
+  
+  roll_yr_vec <- sort(unique(df$roll_yr))
+ 
+  weather.data.mod.final <- dcast(setDT(df),
+                                ID + NAME + LAT + LONG + PROV ~ roll_yr,
+                                value.var = grep("_sum$|_mean$|_min_min$|_max_max$", names(df), value = T))
+  
+  # print(roll_yr_vec)
+  names(weather.data.mod.final) <- gsub(roll_yr_vec[1],"l3",names(weather.data.mod.final))
+  names(weather.data.mod.final) <- gsub(roll_yr_vec[2],"l2",names(weather.data.mod.final))
+  names(weather.data.mod.final) <- gsub(roll_yr_vec[3],"l",names(weather.data.mod.final))
+  return(weather.data.mod.final %>% arrange(ID))
+}
+
+
+
+
+
+## function to check duplicate ID's after transpose due to change in lat,long or Name
+
+CheckDup <- function(df){
+  no.dup <- df %>%
+    filter(ID %in% .[which(duplicated(.$ID)), "ID"])
+  print(no.dup)  
+  return(nrow(no.dup))
+}
+
+
+## function to combine duplicate ID's and roll_yr's, it filters for duplicates and summarises them , just doing sum as data is distirbuted just because of change in lat,long or Name
+
+CombineDup <- function(df){
+combined.dup.ID <- df %>%
+  filter(ID %in% .[which(duplicated(.$ID)), "ID"]) %>%
+  group_by(ID) %>%
+  mutate(NAME = first(NAME), LAT = first(LAT), LONG = first(LONG)) %>%
+  group_by(ID,NAME,LAT,LONG,PROV) %>%
+  summarise_all(funs(sum(., na.rm = T)))
+
+combined.dup.ID <- as.data.frame(combined.dup.ID)
+
+return(combined.dup.ID)
+}
+
+
+## function to create non duplicate data set
+
+CreateNondup <- function(df){
+    return( df %>%  filter(!ID %in% .[which(duplicated(.$ID)), "ID"]))
+}
+
+
+## function to merge combined duplicate and non duplicate ID & roll_yr records
+
+MergeNondupDup <- function(df1, df2){
+ return(rbind(df1, df2))
+}
+
+## Extracting features for AB
+weather.features.AB <- GetFeatures(weather.data, "ID", "roll_yr_AB", "Prov == 'AB'", "roll_yr_AB != 0")
+datalist = list()
+pos = 1
+for (i in c(2016, 2017, 2018, 2019, 2020, 2021)) {
+  df_temp <- weather.features.AB %>% filter(roll_yr %in% c(i-1,i-2,i-3))
+  weather.cf.AB.temp <- GetCummulativeFeatures(df_temp, "ID")
+  weather.cf.AB.trans.temp <- DoTransposeAndRename(weather.cf.AB.temp) %>% mutate(roll_yr = i)
+  datalist[[pos]] <- weather.cf.AB.trans.temp
+  pos = pos + 1
+}
+
+weather.cf.AB.trans = do.call(rbind, datalist)
+weather.cf.AB.trans <- weather.cf.AB.trans %>% mutate(ID = paste(ID,roll_yr,sep="_")) %>% subset(., select = -c(roll_yr))
+num.dup <- CheckDup(weather.cf.AB.trans) # prints duplicate ID records and counts them
+ if(num.dup >1){
+   combined.dup <- CombineDup(weather.cf.AB.trans)
+   non.dup <- CreateNondup(weather.cf.AB.trans)
+   weather.final.AB <- MergeNondupDup(combined.dup,non.dup)
+ } else 
+   weather.final.AB <- weather.cf.AB.trans
+weather.final.AB <- weather.final.AB %>% separate(ID, c("ID","roll_yr"), sep = "_", convert = TRUE)
+
+## saving AB weather features data to LAN
+fwrite(weather.final.AB,"//eig/wat1/data/PPA/P&P/MPA/Projects/Silverlake Data Prep/ON, AB, QC, ATL/2021/Homeowners/04 Data/Weather Station Data/weather_features_AB.csv", row.names=FALSE)
+
+## Extracting features for ON
+weather.features.ON <- GetFeatures(weather.data, "ID", "roll_yr_ON", "Prov == 'ON'", "roll_yr_ON != 0")
+datalist = list()
+pos = 1
+for (i in c(2016, 2017, 2018, 2019, 2020, 2021)) {
+  df_temp <- weather.features.ON %>% filter(roll_yr %in% c(i-1,i-2,i-3))
+  weather.cf.ON.temp <- GetCummulativeFeatures(df_temp, "ID")
+  weather.cf.ON.trans.temp <- DoTransposeAndRename(weather.cf.ON.temp) %>% mutate(roll_yr = i)
+  datalist[[pos]] <- weather.cf.ON.trans.temp
+  pos = pos + 1
+}
+
+weather.cf.ON.trans = do.call(rbind, datalist)
+weather.cf.ON.trans <- weather.cf.ON.trans %>% mutate(ID = paste(ID,roll_yr,sep="_")) %>% subset(., select = -c(roll_yr))
+num.dup <- CheckDup(weather.cf.ON.trans) # prints duplicate ID records and counts them
+ if(num.dup >1){
+   combined.dup <- CombineDup(weather.cf.ON.trans)
+   non.dup <- CreateNondup(weather.cf.ON.trans)
+   weather.final.ON <- MergeNondupDup(combined.dup,non.dup)
+ } else 
+   weather.final.ON <- weather.cf.ON.trans
+weather.final.ON <- weather.final.ON %>% separate(ID, c("ID","roll_yr"), sep = "_", convert = TRUE)
+
+
+## saving ON weather features data to LAN
+fwrite(weather.final.ON,"//eig/wat1/data/PPA/P&P/MPA/Projects/Silverlake Data Prep/ON, AB, QC, ATL/2021/Homeowners/04 Data/Weather Station Data/weather_features_ON.csv", row.names=FALSE)
+
+## Extracting features for NB
+
+weather.features.NB <- GetFeatures(weather.data, "ID", "roll_yr_NB", "Prov == 'NB'", "roll_yr_NB != 0")
+datalist = list()
+pos = 1
+for (i in c(2016, 2017, 2018, 2019, 2020, 2021)) {
+  df_temp <- weather.features.NB %>% filter(roll_yr %in% c(i-1,i-2,i-3))
+  weather.cf.NB.temp <- GetCummulativeFeatures(df_temp, "ID")
+  weather.cf.NB.trans.temp <- DoTransposeAndRename(weather.cf.NB.temp) %>% mutate(roll_yr = i)
+  datalist[[pos]] <- weather.cf.NB.trans.temp
+  pos = pos + 1
+}
+
+weather.cf.NB.trans = do.call(rbind, datalist)
+weather.cf.NB.trans <- weather.cf.NB.trans %>% mutate(ID = paste(ID,roll_yr,sep="_")) %>% subset(., select = -c(roll_yr))
+num.dup <- CheckDup(weather.cf.NB.trans) # prints duplicate ID records and counts them
+ if(num.dup >1){
+   combined.dup <- CombineDup(weather.cf.NB.trans)
+   non.dup <- CreateNondup(weather.cf.NB.trans)
+   weather.final.NB <- MergeNondupDup(combined.dup,non.dup)
+ } else 
+   weather.final.NB <- weather.cf.NB.trans
+weather.final.NB <- weather.final.NB %>% separate(ID, c("ID","roll_yr"), sep = "_", convert = TRUE)
+
+## saving NB weather features data to LAN
+fwrite(weather.final.NB,"//eig/wat1/data/PPA/P&P/MPA/Projects/Silverlake Data Prep/ON, AB, QC, ATL/2021/Homeowners/04 Data/Weather Station Data/weather_features_NB.csv", row.names=FALSE)
+
+## Extracting features for NS
+weather.features.NS <- GetFeatures(weather.data, "ID", "roll_yr_NS", "Prov == 'NS'", "roll_yr_NS != 0")
+datalist = list()
+pos = 1
+for (i in c(2016, 2017, 2018, 2019, 2020, 2021)) {
+  df_temp <- weather.features.NS %>% filter(roll_yr %in% c(i-1,i-2,i-3))
+  weather.cf.NS.temp <- GetCummulativeFeatures(df_temp, "ID")
+  weather.cf.NS.trans.temp <- DoTransposeAndRename(weather.cf.NS.temp) %>% mutate(roll_yr = i)
+  datalist[[pos]] <- weather.cf.NS.trans.temp
+  pos = pos + 1
+}
+
+weather.cf.NS.trans = do.call(rbind, datalist)
+weather.cf.NS.trans <- weather.cf.NS.trans %>% mutate(ID = paste(ID,roll_yr,sep="_")) %>% subset(., select = -c(roll_yr))
+num.dup <- CheckDup(weather.cf.NS.trans) # prints duplicate ID records and counts them
+ if(num.dup >1){
+   combined.dup <- CombineDup(weather.cf.NS.trans)
+   non.dup <- CreateNondup(weather.cf.NS.trans)
+   weather.final.NS <- MergeNondupDup(combined.dup,non.dup)
+ } else 
+   weather.final.NS <- weather.cf.NS.trans
+weather.final.NS <- weather.final.NS %>% separate(ID, c("ID","roll_yr"), sep = "_", convert = TRUE)
+
+## saving NS weather features data to LAN
+
+fwrite(weather.final.NS,"//eig/wat1/data/PPA/P&P/MPA/Projects/Silverlake Data Prep/ON, AB, QC, ATL/2021/Homeowners/04 Data/Weather Station Data/weather_features_NS.csv", row.names=FALSE)
+
+## Extracting features for PE
+weather.features.PE <- GetFeatures(weather.data, "ID", "roll_yr_PE", "Prov == 'PE'", "roll_yr_PE != 0")
+datalist = list()
+pos = 1
+for (i in c(2016, 2017, 2018, 2019, 2020, 2021)) {
+  df_temp <- weather.features.PE %>% filter(roll_yr %in% c(i-1,i-2,i-3))
+  weather.cf.PE.temp <- GetCummulativeFeatures(df_temp, "ID")
+  weather.cf.PE.trans.temp <- DoTransposeAndRename(weather.cf.PE.temp) %>% mutate(roll_yr = i)
+  datalist[[pos]] <- weather.cf.PE.trans.temp
+  pos = pos + 1
+}
+
+weather.cf.PE.trans = do.call(rbind, datalist)
+weather.cf.PE.trans <- weather.cf.PE.trans %>% mutate(ID = paste(ID,roll_yr,sep="_")) %>% subset(., select = -c(roll_yr))
+
+num.dup <- CheckDup(weather.cf.PE.trans) # prints duplicate ID records and counts them
+ if(num.dup >1){
+   combined.dup <- CombineDup(weather.cf.PE.trans)
+   non.dup <- CreateNondup(weather.cf.PE.trans)
+   weather.final.PE <- MergeNondupDup(combined.dup,non.dup)
+ } else 
+   weather.final.PE <- weather.cf.PE.trans
+ weather.final.PE <- weather.final.PE %>% separate(ID, c("ID","roll_yr"), sep = "_", convert = TRUE)
+
+## saving PE weather features data to LAN
+fwrite(weather.final.PE,"//eig/wat1/data/PPA/P&P/MPA/Projects/Silverlake Data Prep/ON, AB, QC, ATL/2021/Homeowners/04 Data/Weather Station Data/weather_features_PE.csv", row.names=FALSE)
+
+## Extracting features for QC
+weather.features.QC <- GetFeatures(weather.data, "ID", "roll_yr_QC", "Prov == 'QC'", "roll_yr_QC != 0")
+datalist = list()
+pos = 1
+for (i in c(2016, 2017, 2018, 2019, 2020, 2021)) {
+  df_temp <- weather.features.QC %>% filter(roll_yr %in% c(i-1,i-2,i-3))
+  weather.cf.QC.temp <- GetCummulativeFeatures(df_temp, "ID")
+  weather.cf.QC.trans.temp <- DoTransposeAndRename(weather.cf.QC.temp) %>% mutate(roll_yr = i)
+  datalist[[pos]] <- weather.cf.QC.trans.temp
+  pos = pos + 1
+}
+trans.temp,weather.features.QC)
+weather.cf.QC.trans = do.call(rbind, datalist)
+weather.cf.QC.trans <- weather.cf.QC.trans %>% mutate(ID = paste(ID,roll_yr,sep="_")) %>% subset(., select = -c(roll_yr))
+num.dup <- CheckDup(weather.cf.QC.trans) # prints duplicate ID records and counts them
+ if(num.dup >1){
+   combined.dup <- CombineDup(weather.cf.QC.trans)
+   non.dup <- CreateNondup(weather.cf.QC.trans)
+   weather.final.QC <- MergeNondupDup(combined.dup,non.dup)
+ } else 
+   weather.final.QC <- weather.cf.QC.trans
+ 
+weather.final.QC <- weather.final.QC %>% separate(ID, c("ID","roll_yr"), sep = "_", convert = TRUE)
+
+
+fwrite(weather.final.QC,"//eig/wat1/data/PPA/P&P/MPA/Projects/Silverlake Data Prep/ON, AB, QC, ATL/2021/Homeowners/04 Data/Weather Station Data/weather_features_QC.csv", row.names=FALSE)
